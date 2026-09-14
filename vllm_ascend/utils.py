@@ -669,6 +669,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
     from vllm.model_executor.custom_op import CustomOp
 
     from vllm_ascend.ops.activation import (
+        AscendGeluAndMul,
         AscendQuickGELU,
         AscendSiluAndMul,
         AscendSiluAndMulWithClamp,
@@ -705,6 +706,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
     global REGISTERED_ASCEND_OPS
     REGISTERED_ASCEND_OPS = {
         "QuickGELU": AscendQuickGELU,
+        "GeluAndMul": AscendGeluAndMul,
         "SiluAndMul": AscendSiluAndMul,
         "SiluAndMulClamp": AscendSiluAndMulWithClamp,
         "RotaryEmbedding": AscendRotaryEmbedding,
@@ -761,6 +763,8 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
             AscendVocabParallelEmbedding310,
         )
 
+        # npu_geglu is unavailable on 310P, so retain vLLM's decomposition.
+        REGISTERED_ASCEND_OPS.pop("GeluAndMul")
         REGISTERED_ASCEND_OPS.update(
             {
                 "SiluAndMul": AscendSiluAndMul310,

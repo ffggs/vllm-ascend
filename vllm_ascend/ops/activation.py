@@ -21,6 +21,7 @@ import torch
 import torch_npu
 from torch import nn
 from vllm.model_executor.layers.activation import (
+    GeluAndMul,
     QuickGELU,
     SiluAndMul,
     SiluAndMulWithClamp,
@@ -86,6 +87,18 @@ class AscendSituAndMul(nn.Module):
 class AscendQuickGELU(QuickGELU):
     def forward_oot(self, x: torch.tensor) -> torch.Tensor:
         out = torch_npu.npu_fast_gelu(x)
+        return out
+
+
+class AscendGeluAndMul(GeluAndMul):
+    def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
+        approximate = 0 if self.approximate == "none" else 1
+        out, _ = torch_npu.npu_geglu(
+            x,
+            dim=-1,
+            approximate=approximate,
+            activate_left=True,
+        )
         return out
 
 

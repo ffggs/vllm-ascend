@@ -18,9 +18,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from vllm.config import set_current_vllm_config
-from vllm.model_executor.layers.activation import QuickGELU, SiluAndMul
+from vllm.model_executor.layers.activation import GeluAndMul, QuickGELU, SiluAndMul
 
 from vllm_ascend.ops.activation import (
+    AscendGeluAndMul,
     AscendQuickGELU,
     AscendSiluAndMul,
     AscendSwigluOAIAndMul,
@@ -64,6 +65,22 @@ def test_AscendQuickGELU_forward_oot(mock_gelu, dummy_tensor, default_vllm_confi
 
     assert torch.allclose(out, dummy_tensor + 1)
     mock_gelu.assert_called_once_with(dummy_tensor)
+
+
+@pytest.mark.parametrize(("approximate", "approximate_index"), [("none", 0), ("tanh", 1)])
+@patch("torch_npu.npu_geglu", return_value=(torch.ones(4, 4), torch.zeros(4, 4)))
+def test_AscendGeluAndMul_forward_oot(mock_geglu, dummy_tensor, default_vllm_config, approximate, approximate_index):
+    layer = AscendGeluAndMul(approximate=approximate)
+
+    out = layer.forward_oot(dummy_tensor)
+
+    mock_geglu.assert_called_once_with(
+        dummy_tensor,
+        dim=-1,
+        approximate=approximate_index,
+        activate_left=True,
+    )
+    assert torch.equal(out, torch.ones(4, 4))
 
 
 @patch("torch_npu.npu_swiglu", side_effect=lambda x: x + 1)
@@ -134,6 +151,11 @@ def _quick_gelu_reference(x: torch.Tensor) -> torch.Tensor:
 def _silu_and_mul_reference(x: torch.Tensor) -> torch.Tensor:
     d = x.shape[-1] // 2
     return torch.nn.functional.silu(x[..., :d]) * x[..., d:]
+
+
+def _gelu_and_mul_reference(x: torch.Tensor) -> torch.Tensor:
+    d = x.shape[-1] // 2
+    return torch.nn.functional.gelu(x[..., :d], approximate="tanh") * x[..., d:]
 
 
 def _swiglustep_and_mul_reference(x: torch.Tensor, limit: float = 7.0) -> torch.Tensor:
@@ -263,6 +285,23 @@ class TestSwiglustepAndMul:
 
 
 class TestActivationNPUPrecision:
+    @pytest.mark.parametrize(
+        "dtype,atol,rtol",
+        [
+            (torch.float16, 2e-2, 1e-2),
+            (torch.bfloat16, 4e-2, 1e-2),
+        ],
+    )
+    def test_ascend_gelu_and_mul_matches_cpu_reference_on_npu(self, dtype, atol, rtol, default_vllm_config):
+        x_cpu = torch.randn(8, 4224, dtype=torch.float32)
+        x_npu = x_cpu.to(dtype=dtype, device="npu")
+
+        result = AscendGeluAndMul(approximate="tanh").forward_oot(x_npu).cpu()
+        expected = _gelu_and_mul_reference(x_cpu.to(dtype=dtype)).float()
+
+        assert result.shape == (8, 2112)
+        assert torch.allclose(result.float(), expected, atol=atol, rtol=rtol)
+
     @pytest.mark.parametrize(
         "dtype,atol,rtol",
         [

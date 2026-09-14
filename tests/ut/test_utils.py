@@ -313,21 +313,41 @@ class TestUtils(TestBase):
 
     @mock.patch("vllm.model_executor.custom_op.CustomOp")
     @mock.patch("vllm_ascend.ops.activation.AscendQuickGELU")
+    @mock.patch("vllm_ascend.ops.activation.AscendGeluAndMul")
     @mock.patch("vllm_ascend.ops.activation.AscendSiluAndMul")
     @mock.patch("vllm_ascend.ops.layernorm.AscendRMSNorm")
     def test_register_ascend_customop(
-        self, mock_ascend_rmsnorm, mock_ascend_silu_and_mul, mock_ascend_quick_gelu, mock_customop
+        self,
+        mock_ascend_rmsnorm,
+        mock_ascend_silu_and_mul,
+        mock_ascend_gelu_and_mul,
+        mock_ascend_quick_gelu,
+        mock_customop,
     ):
         utils._ASCEND_CUSTOMOP_IS_REIGISTERED = False
 
         # ascend custom op is not registered
         utils.register_ascend_customop()
         self.assertEqual(mock_customop.register_oot.call_count, len(REGISTERED_ASCEND_OPS))
+        self.assertIs(utils.REGISTERED_ASCEND_OPS["GeluAndMul"], mock_ascend_gelu_and_mul)
         self.assertTrue(utils._ASCEND_CUSTOMOP_IS_REIGISTERED)
 
         # ascend custom op is already registered
         utils.register_ascend_customop()
         self.assertEqual(mock_customop.register_oot.call_count, len(REGISTERED_ASCEND_OPS))
+
+    @mock.patch("vllm.model_executor.custom_op.CustomOp")
+    @mock.patch("vllm_ascend.utils.is_310p", return_value=True)
+    def test_register_ascend_customop_keeps_native_gelu_and_mul_on_310p(
+        self,
+        mock_is_310p,
+        mock_customop,
+    ):
+        utils._ASCEND_CUSTOMOP_IS_REIGISTERED = False
+
+        utils.register_ascend_customop()
+
+        self.assertNotIn("GeluAndMul", utils.REGISTERED_ASCEND_OPS)
 
     @mock.patch("torch_npu.npu_format_cast")
     def test_maybe_trans_nz(self, mock_npu_format_cast):
