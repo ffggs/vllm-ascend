@@ -38,9 +38,11 @@ class BasePattern(ABC):
     def get_extra_stream_scope_check(self):
         return extra_stream_scope_check
 
+    def get_pattern_id(self) -> str:
+        return f"{self.__class__.__name__}_{self.eps}"
+
     def register(self, pm_pass: PatternMatcherPass) -> None:
-        # Create a unique identifier for this pattern based on class name and eps
-        pattern_id = f"{self.__class__.__name__}_{self.eps}"
+        pattern_id = self.get_pattern_id()
 
         # Skip registration if this pattern has already been registered globally
         if pattern_id in _registered_patterns:

@@ -693,6 +693,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
     from vllm_ascend.ops.rotary_embedding import (
         AscendApplyRotaryEmb,
         AscendDeepseekScalingRotaryEmbedding,
+        AscendGemma4RotaryEmbedding,
         AscendMRotaryEmbedding,
         AscendRotaryEmbedding,
         AscendYaRNRotaryEmbedding,
@@ -710,6 +711,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
         "SiluAndMul": AscendSiluAndMul,
         "SiluAndMulClamp": AscendSiluAndMulWithClamp,
         "RotaryEmbedding": AscendRotaryEmbedding,
+        "Gemma4RotaryEmbedding": AscendGemma4RotaryEmbedding,
         "MRotaryEmbedding": AscendMRotaryEmbedding,
         "ColumnParallelLinear": AscendColumnParallelLinear,
         "RowParallelLinear": AscendRowParallelLinear,
@@ -765,6 +767,8 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
 
         # npu_geglu is unavailable on 310P, so retain vLLM's decomposition.
         REGISTERED_ASCEND_OPS.pop("GeluAndMul")
+        # Gemma4's OOT path is validated on the common Triton rotary path.
+        REGISTERED_ASCEND_OPS.pop("Gemma4RotaryEmbedding")
         REGISTERED_ASCEND_OPS.update(
             {
                 "SiluAndMul": AscendSiluAndMul310,

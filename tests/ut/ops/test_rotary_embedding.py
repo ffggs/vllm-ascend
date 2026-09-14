@@ -19,8 +19,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, YaRNScalingRotaryEmbedding
+from vllm.model_executor.layers.rotary_embedding import (
+    Gemma4RotaryEmbedding,
+    RotaryEmbedding,
+    YaRNScalingRotaryEmbedding,
+)
 
+import vllm_ascend.ops.rotary_embedding as rotary_embedding_module
 from vllm_ascend.ops.rotary_embedding import (
     AscendRotaryEmbedding,
     AscendYaRNRotaryEmbedding,
@@ -301,6 +306,26 @@ class TestAscendEmbeddingForwardOOT:
         accordingly.
         """
         check_parent_init_signature_has_not_changed(RotaryEmbedding.__init__, AscendRotaryEmbedding.__init__)
+
+
+class TestAscendGemma4RotaryEmbeddingForwardOOT:
+    @patch("vllm_ascend.ops.rotary_embedding.AscendRotaryEmbedding.forward_oot")
+    def test_delegates_to_common_npu_rotary_path(self, mock_delegate):
+        embedding = object.__new__(rotary_embedding_module.AscendGemma4RotaryEmbedding)
+        positions, query, key = _make_tensors(head_size=HEAD_SIZE)
+        expected = (query, key)
+        mock_delegate.return_value = expected
+
+        actual = embedding.forward_oot(positions, query, key)
+
+        mock_delegate.assert_called_once_with(embedding, positions, query, key, None, None)
+        assert actual is expected
+
+    def test_parent_init_signature_has_not_changed(self):
+        check_parent_init_signature_has_not_changed(
+            Gemma4RotaryEmbedding.__init__,
+            rotary_embedding_module.AscendGemma4RotaryEmbedding.__init__,
+        )
 
 
 class TestAscendYaRNRotaryEmbeddingForwardOOT:

@@ -349,6 +349,23 @@ class TestUtils(TestBase):
 
         self.assertNotIn("GeluAndMul", utils.REGISTERED_ASCEND_OPS)
 
+    @mock.patch("vllm.model_executor.custom_op.CustomOp")
+    def test_register_ascend_customop_includes_gemma4_rotary(self, mock_customop):
+        from vllm_ascend.ops.rotary_embedding import AscendGemma4RotaryEmbedding
+
+        utils._ASCEND_CUSTOMOP_IS_REIGISTERED = False
+        utils.register_ascend_customop()
+
+        self.assertIs(utils.REGISTERED_ASCEND_OPS["Gemma4RotaryEmbedding"], AscendGemma4RotaryEmbedding)
+
+    @mock.patch("vllm.model_executor.custom_op.CustomOp")
+    @mock.patch("vllm_ascend.utils.is_310p", return_value=True)
+    def test_register_ascend_customop_keeps_native_gemma4_rotary_on_310p(self, mock_is_310p, mock_customop):
+        utils._ASCEND_CUSTOMOP_IS_REIGISTERED = False
+        utils.register_ascend_customop()
+
+        self.assertNotIn("Gemma4RotaryEmbedding", utils.REGISTERED_ASCEND_OPS)
+
     @mock.patch("torch_npu.npu_format_cast")
     def test_maybe_trans_nz(self, mock_npu_format_cast):
         from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ

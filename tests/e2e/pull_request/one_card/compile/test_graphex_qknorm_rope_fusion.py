@@ -1,4 +1,5 @@
 import copy
+from pathlib import Path
 
 import npugraph_ex as nge
 import numpy as np
@@ -11,6 +12,7 @@ from vllm.distributed import ensure_model_parallel_initialized, init_distributed
 from vllm.utils.system_utils import update_environment_variables
 
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
+from vllm_ascend.compilation.passes.base_pattern import _registered_patterns
 from vllm_ascend.compilation.passes.qknorm_rope_fusion_pass import (
     QKNormRopeFusionPattern,
     QKNormRopeFusionPatternWithBias,
@@ -18,6 +20,7 @@ from vllm_ascend.compilation.passes.qknorm_rope_fusion_pass import (
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 
 MAX_POSITION_EMBEDDING = 262144
+TEST_MODEL_PATH = Path(__file__).resolve().parents[4] / "ut" / "_fake_weight"
 
 
 def find_op(gm, op_default):
@@ -45,6 +48,7 @@ class ModelQKNormRopeWithoutBias(nn.Module):
     def __init__(
         self,
         head_dim: int,
+        rope_dim: int,
         num_heads: int,
         num_kv_heads: int,
         dtype: torch.dtype = torch.bfloat16,
@@ -53,6 +57,7 @@ class ModelQKNormRopeWithoutBias(nn.Module):
     ):
         super().__init__()
         self.head_dim = head_dim
+        self.rope_dim = rope_dim
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.q_size = num_heads * head_dim
@@ -89,7 +94,7 @@ class ModelQKNormRopeWithoutBias(nn.Module):
 
         # Apply RoPE
         q_rope, k_rope = torch.ops.vllm.npu_rotary_embedding(
-            positions, q_flat, k_flat, cos_sin_cache, self.head_dim, self.head_dim, True
+            positions, q_flat, k_flat, cos_sin_cache, self.head_dim, self.rope_dim, True
         )
 
         return q_rope, k_rope, v
@@ -99,6 +104,7 @@ class ModelQKNormRopeWithBias(nn.Module):
     def __init__(
         self,
         head_dim: int,
+        rope_dim: int,
         num_heads: int,
         num_kv_heads: int,
         dtype: torch.dtype = torch.bfloat16,
@@ -107,6 +113,7 @@ class ModelQKNormRopeWithBias(nn.Module):
     ):
         super().__init__()
         self.head_dim = head_dim
+        self.rope_dim = rope_dim
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.q_size = num_heads * head_dim
@@ -138,7 +145,7 @@ class ModelQKNormRopeWithBias(nn.Module):
 
         # Apply RoPE
         q_rope, k_rope = torch.ops.vllm.npu_rotary_embedding(
-            positions, q_flat, k_flat, cos_sin_cache, self.head_dim, self.head_dim, True
+            positions, q_flat, k_flat, cos_sin_cache, self.head_dim, self.rope_dim, True
         )
 
         return q_rope, k_rope, v
@@ -165,14 +172,27 @@ def assert_qknorm_rope_fusion(after_gm, expect_fused=True, use_bias=False):
 @pytest.mark.parametrize("num_tokens", [257])
 @pytest.mark.parametrize("eps", [1e-5])
 @pytest.mark.parametrize("use_bias", [False, True])
+@pytest.mark.parametrize(
+    "head_dim,rope_dim,num_heads,num_kv_heads",
+    [(128, 128, 16, 8), (256, 256, 16, 8), (512, 512, 16, 2)],
+)
 def test_rmsnorm_quant_fusion(
+    tmp_path,
     dtype: torch.dtype,
     hidden_size: int,
     num_tokens: int,
     eps: float,
     use_bias: bool,
+    head_dim: int,
+    rope_dim: int,
+    num_heads: int,
+    num_kv_heads: int,
 ):
-    vllm_config = VllmConfig(model_config=ModelConfig(dtype=dtype))
+    if head_dim == 512 and use_bias:
+        pytest.skip("Gemma4 global attention does not use QKV bias")
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(model=str(TEST_MODEL_PATH), dtype=dtype)
+    )
     with vllm.config.set_current_vllm_config(vllm_config):
         update_environment_variables(
             {
@@ -183,34 +203,38 @@ def test_rmsnorm_quant_fusion(
                 "MASTER_PORT": "12345",
             }
         )
-        init_distributed_environment()
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method=f"file://{tmp_path / 'distributed_init'}",
+            backend="hccl",
+        )
         ensure_model_parallel_initialized(1, 1)
-    num_heads = 16
-    num_kv_heads = 8
-    head_dim = 128
     with vllm.config.set_current_vllm_config(vllm_config), set_ascend_forward_context(None, vllm_config):
         fusion_pattern = None
         q_size = num_heads * head_dim
         kv_size = num_kv_heads * head_dim
         qkv_size = q_size + 2 * kv_size
         if use_bias:
-            model = ModelQKNormRopeWithBias(head_dim, num_heads, num_kv_heads, dtype, eps, device="npu")
+            model = ModelQKNormRopeWithBias(head_dim, rope_dim, num_heads, num_kv_heads, dtype, eps, device="npu")
             fusion_pattern = QKNormRopeFusionPatternWithBias(
-                vllm_config=vllm_config, head_dim=head_dim, num_heads=num_heads, num_kv_heads=num_kv_heads, eps=eps
+                vllm_config=vllm_config, head_dim=head_dim, num_heads=num_heads, num_kv_heads=num_kv_heads, eps=eps, rope_dim=rope_dim
             )
         else:
-            model = ModelQKNormRopeWithoutBias(head_dim, num_heads, num_kv_heads, dtype, eps, device="npu")
+            model = ModelQKNormRopeWithoutBias(head_dim, rope_dim, num_heads, num_kv_heads, dtype, eps, device="npu")
             fusion_pattern = QKNormRopeFusionPattern(
-                vllm_config=vllm_config, head_dim=head_dim, num_heads=num_heads, num_kv_heads=num_kv_heads, eps=eps
+                vllm_config=vllm_config, head_dim=head_dim, num_heads=num_heads, num_kv_heads=num_kv_heads, eps=eps, rope_dim=rope_dim
             )
         from torch._inductor.pattern_matcher import PatternMatcherPass
 
         pm_pass = PatternMatcherPass()
+        _registered_patterns.discard(fusion_pattern.get_pattern_id())
         fusion_pattern.register(pm_pass)
         model = model.to("npu")
         seq_len = num_tokens
         qkv = torch.randn(seq_len, qkv_size, device="npu", dtype=dtype)
-        cos_sin_cache = torch.from_numpy(np.random.uniform(0, 1, [MAX_POSITION_EMBEDDING, head_dim])).to(dtype).npu()
+        cos_sin_cache = torch.from_numpy(np.random.uniform(0, 1, [MAX_POSITION_EMBEDDING, rope_dim])).to(dtype).npu()
         positions = torch.randint(
             low=0, high=MAX_POSITION_EMBEDDING, size=(num_tokens,), dtype=torch.int64, device="npu"
         )
@@ -223,6 +247,9 @@ def test_rmsnorm_quant_fusion(
 
             compiled_model = torch.compile(model, backend="npugraph_ex", fullgraph=True, dynamic=True)
 
-            compiled_model(qkv, cos_sin_cache, positions)
+            expected = model(qkv, cos_sin_cache, positions)
+            actual = compiled_model(qkv, cos_sin_cache, positions)
+            for actual_tensor, expected_tensor in zip(actual, expected):
+                torch.testing.assert_close(actual_tensor, expected_tensor, atol=5e-2, rtol=5e-3)
 
             nge.npu_fx_compiler._optimize_fx = original_optimize

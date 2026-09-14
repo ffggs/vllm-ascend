@@ -29,7 +29,15 @@ from vllm_ascend.utils import get_rope_dim
 
 
 class QKNormRopeFusionPattern(BasePattern):
-    def __init__(self, vllm_config, head_dim, num_heads, num_kv_heads, eps=1e-6):
+    def __init__(
+        self,
+        vllm_config,
+        head_dim,
+        num_heads,
+        num_kv_heads,
+        eps=1e-6,
+        rope_dim=None,
+    ):
         super().__init__(vllm_config, eps)
         self.head_dim = head_dim
         self.num_heads = num_heads
@@ -37,7 +45,17 @@ class QKNormRopeFusionPattern(BasePattern):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.device = vllm_config.device_config.device if vllm_config.device_config else None
-        self.rope_dim = get_rope_dim(vllm_config)
+        self.rope_dim = rope_dim if rope_dim is not None else get_rope_dim(vllm_config)
+
+    def get_pattern_id(self) -> str:
+        return f"{super().get_pattern_id()}_{self.head_dim}_{self.rope_dim}_{self.num_heads}_{self.num_kv_heads}"
+
+    def _check_qkv_size(self, qkv: torch.Tensor) -> None:
+        expected_size = self.q_size + 2 * self.kv_size
+        if qkv.shape[-1] != expected_size:
+            raise RuntimeError(
+                f"QKV hidden size {qkv.shape[-1]} does not match pattern size {expected_size}"
+            )
 
     def get_inputs(self):
         T = 5
@@ -57,6 +75,7 @@ class QKNormRopeFusionPattern(BasePattern):
             cos_sin_cache: torch.Tensor,
             positions: torch.Tensor,
         ):
+            self._check_qkv_size(qkv)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
             q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
@@ -103,7 +122,15 @@ class QKNormRopeFusionPattern(BasePattern):
 
 
 class QKNormRopeFusionPatternWithBias(BasePattern):
-    def __init__(self, vllm_config, head_dim, num_heads, num_kv_heads, eps=1e-6):
+    def __init__(
+        self,
+        vllm_config,
+        head_dim,
+        num_heads,
+        num_kv_heads,
+        eps=1e-6,
+        rope_dim=None,
+    ):
         super().__init__(vllm_config, eps)
         self.head_dim = head_dim
         self.num_heads = num_heads
@@ -111,7 +138,17 @@ class QKNormRopeFusionPatternWithBias(BasePattern):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.device = vllm_config.device_config.device if vllm_config.device_config else None
-        self.rope_dim = get_rope_dim(vllm_config)
+        self.rope_dim = rope_dim if rope_dim is not None else get_rope_dim(vllm_config)
+
+    def get_pattern_id(self) -> str:
+        return f"{super().get_pattern_id()}_{self.head_dim}_{self.rope_dim}_{self.num_heads}_{self.num_kv_heads}"
+
+    def _check_qkv_size(self, qkv: torch.Tensor) -> None:
+        expected_size = self.q_size + 2 * self.kv_size
+        if qkv.shape[-1] != expected_size:
+            raise RuntimeError(
+                f"QKV hidden size {qkv.shape[-1]} does not match pattern size {expected_size}"
+            )
 
     def get_inputs(self):
         T = 5
@@ -136,6 +173,7 @@ class QKNormRopeFusionPatternWithBias(BasePattern):
             cos_sin_cache: torch.Tensor,
             positions: torch.Tensor,
         ):
+            self._check_qkv_size(qkv)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
             q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
@@ -198,31 +236,53 @@ class QKNormRopeFusionPass(VllmInductorPass):
             logger.debug("QKNorm and Rope fusion not enabled: unsupported dtype %s", dtype)
             return
 
-        # use one attn layer to get meta (such as head_dim) for QKNormRopeFusionPattern
         attn_layers: dict[str, Attention] = get_layers_from_vllm_config(vllm_config, Attention)
         if len(attn_layers) == 0:
             logger.debug("QKNorm and Rope fusion enabled, but no Attention layers were discovered.")
             return
-        layer = next(iter(attn_layers.values()))
-        for epsilon in [1e-6, 1e-5]:
-            if layer.head_size != 128:
-                logger.debug("QKNorm and Rope fusion not enabled: head_dim %d is not equal of 128", layer.head_size)
+        architectures = getattr(vllm_config.model_config, "architectures", []) or []
+        is_gemma4 = any("Gemma4" in architecture for architecture in architectures)
+        register_bias_pattern = not is_gemma4 or getattr(
+            vllm_config.model_config.hf_text_config,
+            "attention_bias",
+            True,
+        )
+        registered_specs = set()
+        for layer in attn_layers.values():
+            if is_gemma4:
+                # Gemma4 proportional RoPE uses a full-head cache; the
+                # non-rotated dimensions are represented by identity values.
+                rope_dim = layer.head_size
+                supported = layer.head_size in (256, 512)
+            else:
+                rope_dim = get_rope_dim(vllm_config)
+                supported = layer.head_size == 128
+            if not supported:
+                logger.debug("QKNorm and Rope fusion not enabled: unsupported head_dim %d", layer.head_size)
                 continue
-            QKNormRopeFusionPattern(
-                vllm_config=vllm_config,
-                head_dim=layer.head_size,
-                num_heads=layer.num_heads,
-                num_kv_heads=layer.num_kv_heads,
-                eps=epsilon,
-            ).register(self.pattern_match_passes)
+            spec = (layer.head_size, layer.num_heads, layer.num_kv_heads, rope_dim)
+            if spec in registered_specs:
+                continue
+            registered_specs.add(spec)
+            for epsilon in [1e-6, 1e-5]:
+                QKNormRopeFusionPattern(
+                    vllm_config=vllm_config,
+                    head_dim=layer.head_size,
+                    num_heads=layer.num_heads,
+                    num_kv_heads=layer.num_kv_heads,
+                    eps=epsilon,
+                    rope_dim=rope_dim,
+                ).register(self.pattern_match_passes)
 
-            QKNormRopeFusionPatternWithBias(
-                vllm_config=vllm_config,
-                head_dim=layer.head_size,
-                num_heads=layer.num_heads,
-                num_kv_heads=layer.num_kv_heads,
-                eps=epsilon,
-            ).register(self.pattern_match_passes)
+                if register_bias_pattern:
+                    QKNormRopeFusionPatternWithBias(
+                        vllm_config=vllm_config,
+                        head_dim=layer.head_size,
+                        num_heads=layer.num_heads,
+                        num_kv_heads=layer.num_kv_heads,
+                        eps=epsilon,
+                        rope_dim=rope_dim,
+                    ).register(self.pattern_match_passes)
 
     def __call__(self, graph: torch.fx.Graph):
         self.begin()
