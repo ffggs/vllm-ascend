@@ -108,20 +108,22 @@ def cache_graph_workspace(
     candidate_workspace: torch.Tensor,
     *,
     use_max_workspace: bool,
+    workspace_cache: dict[int, torch.Tensor | None] | None = None,
 ) -> torch.Tensor:
     # Most models keep the original first-workspace cache behavior. Models with
     # mixed attention layer shapes may need the largest workspace for a graph
-    # size because layers can require different FIA workspace sizes.
-    current_workspace = graph_params.workspaces.get(num_tokens)
+    # size because layers can require different workspace sizes.
+    workspace_cache = graph_params.workspaces if workspace_cache is None else workspace_cache
+    current_workspace = workspace_cache.get(num_tokens)
     if use_max_workspace:
         if current_workspace is None or (
             candidate_workspace.numel() * candidate_workspace.element_size()
             > current_workspace.numel() * current_workspace.element_size()
         ):
-            graph_params.workspaces[num_tokens] = candidate_workspace
+            workspace_cache[num_tokens] = candidate_workspace
     elif current_workspace is None:
-        graph_params.workspaces[num_tokens] = candidate_workspace
-    return graph_params.workspaces[num_tokens]
+        workspace_cache[num_tokens] = candidate_workspace
+    return workspace_cache[num_tokens]
 
 
 @lru_cache(maxsize=1)

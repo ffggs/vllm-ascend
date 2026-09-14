@@ -809,6 +809,7 @@ class TestSleepGraphParams(TestBase):
             workspaces={4: torch.empty(1), 8: torch.empty(2)},
             handles={4: [], 8: []},
             attn_params={4: [], 8: []},
+            paged_attention_workspaces={4: torch.empty(3), 8: torch.empty(4)},
         )
 
         with (
@@ -821,6 +822,8 @@ class TestSleepGraphParams(TestBase):
         self.assertEqual(set(graph_params.workspaces), {4, 8})
         self.assertIsNone(graph_params.workspaces[4])
         self.assertIsNone(graph_params.workspaces[8])
+        self.assertIsNone(graph_params.paged_attention_workspaces[4])
+        self.assertIsNone(graph_params.paged_attention_workspaces[8])
 
     def test_reset_graph_params_for_sleep_clears_registered_wrappers(self):
         wrapper = MagicMock()

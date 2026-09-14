@@ -45,6 +45,26 @@ class TestAttentionGraphHelpers(TestBase):
         self.assertEqual(result.numel(), 8)
         self.assertEqual(graph_params.workspaces[1].numel(), 8)
 
+    def test_cache_graph_workspace_uses_explicit_cache(self):
+        fia_workspace = torch.empty(4)
+        paged_attention_workspace = torch.empty(8)
+        graph_params = SimpleNamespace(
+            workspaces={1: fia_workspace},
+            paged_attention_workspaces={1: None},
+        )
+
+        result = cache_graph_workspace(
+            graph_params,
+            1,
+            paged_attention_workspace,
+            use_max_workspace=True,
+            workspace_cache=graph_params.paged_attention_workspaces,
+        )
+
+        self.assertIs(result, paged_attention_workspace)
+        self.assertIs(graph_params.workspaces[1], fia_workspace)
+        self.assertIs(graph_params.paged_attention_workspaces[1], paged_attention_workspace)
+
     def test_large_head_uses_paged_attention_on_a2(self):
         vllm_config = MagicMock()
         vllm_config.speculative_config = None
@@ -533,6 +553,45 @@ class TestAscendAttentionBackendImpl(TestBase):
 
         mock_paged_attention.assert_called_once()
         assert output.shape == (4, 8 * 64)
+
+    def test_full_graph_pa_isolates_workspace_from_fia(self):
+        query = torch.empty(1, 8, 64)
+        output = torch.empty_like(query)
+        fia_workspace = torch.empty(4)
+        paged_attention_workspace = torch.empty(8)
+        graph_params = SimpleNamespace(
+            workspaces={1: fia_workspace},
+            paged_attention_workspaces={1: None},
+            events={1: []},
+            attn_params={1: []},
+            handles={1: []},
+        )
+        attn_metadata = SimpleNamespace(
+            block_tables=torch.zeros(1, 1, dtype=torch.int32),
+            seq_lens=torch.ones(1, dtype=torch.int32),
+        )
+        self.impl.key_cache = torch.empty(1, 1, 8, 64)
+        self.impl.value_cache = torch.empty(1, 1, 8, 64)
+
+        with (
+            patch("vllm_ascend.attention.attention_v1.get_graph_params", return_value=graph_params),
+            patch("vllm_ascend.attention.attention_v1._EXTRA_CTX") as mock_extra_ctx,
+            patch("vllm_ascend.attention.attention_v1.weak_ref_tensors", side_effect=lambda tensor: tensor),
+            patch("torch.npu.ExternalEvent", return_value=MagicMock()),
+            patch("torch.npu.graph_task_group_begin"),
+            patch("torch.npu.graph_task_group_end", return_value=MagicMock()),
+            patch(
+                "torch_npu._npu_paged_attention_get_workspace",
+                return_value=paged_attention_workspace,
+            ),
+            patch("torch_npu._npu_paged_attention") as mock_paged_attention,
+        ):
+            mock_extra_ctx.capturing = True
+            self.impl.full_graph_pa(query, attn_metadata, output)
+
+        self.assertIs(graph_params.workspaces[1], fia_workspace)
+        self.assertIs(graph_params.paged_attention_workspaces[1], paged_attention_workspace)
+        self.assertIs(mock_paged_attention.call_args.kwargs["workspace"], paged_attention_workspace)
 
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     @patch("torch_npu.npu_fused_infer_attention_score")

@@ -5,7 +5,7 @@ import dataclasses
 import weakref
 from collections.abc import Callable
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import patch
 
@@ -267,10 +267,12 @@ class ACLGraphWrapper:
 def weak_ref_workspaces(params):
     if params is None:
         return
-    for num_tokens in params.workspaces:
-        if params.workspaces[num_tokens] is None:
-            continue
-        params.workspaces[num_tokens] = weak_ref_tensors(params.workspaces[num_tokens])
+    workspace_caches = (params.workspaces, getattr(params, "paged_attention_workspaces", {}))
+    for workspace_cache in workspace_caches:
+        for num_tokens in workspace_cache:
+            if workspace_cache[num_tokens] is None:
+                continue
+            workspace_cache[num_tokens] = weak_ref_tensors(workspace_cache[num_tokens])
 
 
 def update_full_graph_params(
@@ -299,6 +301,7 @@ class GraphParams:
     workspaces: dict[int, torch.Tensor | None]
     handles: dict[int, list[torch_npu._C._NPUTaskGroupHandle]]
     attn_params: dict[int, list[tuple]]
+    paged_attention_workspaces: dict[int, torch.Tensor | None] = field(default_factory=dict)
 
 
 GraphParamsByLoRA = dict[bool, GraphParams]
@@ -310,6 +313,7 @@ def _new_graph_params(aclgraph_capture_sizes: list[int]) -> GraphParams:
         {size: None for size in aclgraph_capture_sizes},
         {size: [] for size in aclgraph_capture_sizes},
         {size: [] for size in aclgraph_capture_sizes},
+        {size: None for size in aclgraph_capture_sizes},
     )
 
 

@@ -73,8 +73,10 @@ class AclGraphSleepWakeupManager:
     def clear_attention_workspaces(params) -> None:
         if params is None:
             return
-        for num_tokens in params.workspaces:
-            params.workspaces[num_tokens] = None
+        workspace_caches = (params.workspaces, getattr(params, "paged_attention_workspaces", {}))
+        for workspace_cache in workspace_caches:
+            for num_tokens in workspace_cache:
+                workspace_cache[num_tokens] = None
 
     @classmethod
     def clear_all_attention_workspaces(cls) -> None:

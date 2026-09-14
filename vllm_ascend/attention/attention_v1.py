@@ -1152,21 +1152,27 @@ class AscendAttentionBackendImpl(AttentionImpl):
         graph_params = get_graph_params()
         num_tokens = query.shape[0]
         if _EXTRA_CTX.capturing:
-            # Get workspace from cache or calculate it if not present.
-            workspace = graph_params.workspaces.get(num_tokens)
-            if workspace is None:
-                workspace = torch_npu._npu_paged_attention_get_workspace(
-                    query=query,
-                    key_cache=self.key_cache,
-                    value_cache=self.value_cache,
-                    num_kv_heads=self.num_kv_heads,
-                    num_heads=self.num_heads,
-                    scale_value=self.scale,
-                    block_table=attn_metadata.block_tables,
-                    context_lens=attn_metadata.seq_lens,
-                    out=output,
-                )
-                update_graph_params_workspaces(num_tokens, workspace)
+            # Mixed-attention models capture FIA before PA. PA workspaces must
+            # not reuse the generic FIA cache because their operator contract
+            # can require a larger allocation for the same graph size.
+            candidate_workspace = torch_npu._npu_paged_attention_get_workspace(
+                query=query,
+                key_cache=self.key_cache,
+                value_cache=self.value_cache,
+                num_kv_heads=self.num_kv_heads,
+                num_heads=self.num_heads,
+                scale_value=self.scale,
+                block_table=attn_metadata.block_tables,
+                context_lens=attn_metadata.seq_lens,
+                out=output,
+            )
+            workspace = cache_graph_workspace(
+                graph_params,
+                num_tokens,
+                candidate_workspace,
+                use_max_workspace=True,
+                workspace_cache=graph_params.paged_attention_workspaces,
+            )
 
             # Handle graph capturing mode
             stream = torch_npu.npu.current_stream()
