@@ -26,7 +26,7 @@ from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
-from functools import partial
+from functools import partial, wraps
 from multiprocessing import Manager
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
 
@@ -122,6 +122,7 @@ from vllm_ascend.attention.utils import (
     get_sfa_qsfa_packed_head_dim,
     using_paged_attention,
 )
+from vllm_ascend.profiler.request_trace import RequestTrace
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -222,6 +223,20 @@ from vllm_ascend.core.kv_cache_interface import (
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
 torch.npu.config.allow_internal_format = True
+
+
+def _request_trace_end_on_error(method):
+    """Close an active request trace step when runner execution raises."""
+
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except Exception:
+            self._end_request_trace_step("error")
+            raise
+
+    return wrapped
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -337,6 +352,10 @@ class NPUModelRunner(GPUModelRunner):
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        self._request_trace = RequestTrace(rank=self.dp_rank)
+        self._request_trace_step = 0
+        self._request_trace_active_step: int | None = None
+        self._request_trace_active_fields: dict[str, Any] | None = None
 
         self.sampler = AscendSampler()
         self.attn_state: AscendAttentionState | None = None
@@ -1788,12 +1807,60 @@ class NPUModelRunner(GPUModelRunner):
                 self.draft_token_ids_cpu[:num_reqs] = 0
             self.draft_token_ids_event.record()
 
+    def _end_request_trace_step(self, status: str = "completed") -> None:
+        step_id = getattr(self, "_request_trace_active_step", None)
+        fields = getattr(self, "_request_trace_active_fields", None)
+        if step_id is None or fields is None:
+            return
+        trace = getattr(self, "_request_trace", None)
+        if trace is not None:
+            trace.emit(
+                "worker_step_end", step_id=step_id, status=status, **fields
+            )
+        self._request_trace_active_step = None
+        self._request_trace_active_fields = None
+
+    @_request_trace_end_on_error
     @torch.inference_mode()
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        trace = getattr(self, "_request_trace", None)
+        if trace is None:
+            trace = RequestTrace(rank=0)
+            self._request_trace = trace
+        trace_step = getattr(self, "_request_trace_step", 0)
+        self._request_trace_step = trace_step + 1
+        self._request_trace_active_step = trace_step
+        scheduled_tokens_map = getattr(scheduler_output, "num_scheduled_tokens", {})
+        trace_req_ids = list(scheduled_tokens_map.keys())
+        trace_scheduled_tokens = dict(scheduled_tokens_map)
+        scheduled_new_reqs = getattr(scheduler_output, "scheduled_new_reqs", ())
+        scheduled_cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        trace_computed_tokens = {
+            data.req_id: data.num_computed_tokens
+            for data in scheduled_new_reqs
+        }
+        if scheduled_cached_reqs is not None:
+            trace_computed_tokens.update(
+                dict(
+                    zip(
+                        getattr(scheduled_cached_reqs, "req_ids", ()),
+                        getattr(scheduled_cached_reqs, "num_computed_tokens", ()),
+                    )
+                )
+            )
+        trace_fields = {
+            "request_ids": trace_req_ids,
+            "scheduled_tokens": trace_scheduled_tokens,
+            "computed_tokens": trace_computed_tokens,
+            "total_scheduled_tokens": getattr(scheduler_output, "total_num_scheduled_tokens", 0),
+        }
+        self._request_trace_active_fields = trace_fields
+        if trace is not None:
+            trace.emit("worker_step_begin", step_id=trace_step, **trace_fields)
         if self.vllm_config.model_config.enable_return_routed_experts:
             if self.routed_experts_initialized:
                 self.routed_experts_capturer.clear_buffer()
@@ -1856,7 +1923,10 @@ class NPUModelRunner(GPUModelRunner):
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        with record_function_or_nullcontext("prepare input"):
+        with (
+            self._request_trace.phase(trace_step, "prepare_input", **trace_fields),
+            record_function_or_nullcontext("prepare input"),
+        ):
             with self.synchronize_input_prep():
                 # Fix up prev_req_id_to_index for requests that were discarded
                 # in the previous sample_tokens step. If a request has
@@ -1890,6 +1960,7 @@ class NPUModelRunner(GPUModelRunner):
                     ) as ec_connector_output:
                         self._execute_mm_encoder(scheduler_output)
                         self._finalize_dump_data()
+                        self._end_request_trace_step("encoder_only")
                         return make_empty_encoder_model_runner_output(scheduler_output)
 
                 if not num_scheduled_tokens:
@@ -1906,7 +1977,9 @@ class NPUModelRunner(GPUModelRunner):
                         self._dummy_run(1, skip_gdn_state_update=True)
                     if not has_kv_transfer_group():
                         # Return empty ModelRunnerOutput if no work to do.
+                        self._end_request_trace_step("no_forward")
                         return EMPTY_MODEL_RUNNER_OUTPUT
+                    self._end_request_trace_step("no_forward")
                     return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
                 if self.cache_config.kv_sharing_fast_prefill:
                     assert not self.num_prompt_logprobs, (
@@ -1921,7 +1994,9 @@ class NPUModelRunner(GPUModelRunner):
                 if (scheduler_output.total_num_scheduled_tokens <= 0
                         or not tokens or sum(tokens) == 0):
                     if not has_kv_transfer_group():
+                        self._end_request_trace_step("no_forward")
                         return EMPTY_MODEL_RUNNER_OUTPUT
+                    self._end_request_trace_step("no_forward")
                     return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
                 self._start_dump_data()
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
@@ -2113,10 +2188,17 @@ class NPUModelRunner(GPUModelRunner):
         has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
 
         # Run forward pass
+        forward_fields = {
+            **trace_fields,
+            "num_tokens_padded": num_tokens_padded,
+            "num_reqs": num_reqs,
+            "cudagraph_mode": str(cudagraph_mode),
+        }
         defer_kv_connector_finalize = self.speculative_config is not None and (
             get_pp_group().is_last_rank or self.broadcast_pp_output
         )
         with (
+            self._request_trace.phase(trace_step, "forward", **forward_fields),
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
                 attn_metadata,
@@ -2144,7 +2226,10 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
-        with record_function_or_nullcontext("post process"):
+        with (
+            self._request_trace.phase(trace_step, "post_process", **forward_fields),
+            record_function_or_nullcontext("post process"),
+        ):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
                 hidden_states, aux_hidden_states = hidden_states
@@ -2158,6 +2243,7 @@ class NPUModelRunner(GPUModelRunner):
                     self._finalize_dump_data()
                     if self.dynamic_eplb:
                         self.eplb_updator.forward_end(self.eplb_heat_collection_status)
+                    self._end_request_trace_step("intermediate_output")
                     return hidden_states
                 if self.is_pooling_model:
                     # Return the pooling output.
@@ -2166,6 +2252,7 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     output.kv_connector_output = kv_connector_output
                     self._finalize_dump_data()
+                    self._end_request_trace_step("pool_output")
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
@@ -2214,10 +2301,16 @@ class NPUModelRunner(GPUModelRunner):
             deferred_state_corrections_fn()
         return None
 
+    @_request_trace_end_on_error
     @torch.inference_mode()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        if not hasattr(self, "_request_trace"):
+            self._request_trace = RequestTrace(rank=0)
+        trace_step = self._request_trace_active_step
+        trace_fields = self._request_trace_active_fields or {}
+        self._request_trace.emit("sample_begin", step_id=trace_step, **trace_fields)
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
         pp = get_pp_group()
@@ -2226,14 +2319,17 @@ class NPUModelRunner(GPUModelRunner):
         if self.execute_model_state is None:
             # Nothing to do (PP non-final rank case), output isn't used.
             if not kv_connector_output:
+                self._end_request_trace_step("empty_sample")
                 return None  # noqa
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
             if kv_connector_output.is_empty():
+                self._end_request_trace_step("empty_sample")
                 return EMPTY_MODEL_RUNNER_OUTPUT
 
             output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
             output.kv_connector_output = kv_connector_output
+            self._end_request_trace_step("connector_output")
             return output
 
         # Unpack ephemeral state.
@@ -2263,7 +2359,10 @@ class NPUModelRunner(GPUModelRunner):
             apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
 
-        with record_function_or_nullcontext("sample_token"):
+        with (
+            self._request_trace.phase(trace_step, "sample_token", **trace_fields),
+            record_function_or_nullcontext("sample_token"),
+        ):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         if self.need_accepted_tokens:
@@ -2313,21 +2412,22 @@ class NPUModelRunner(GPUModelRunner):
                 with record_function_or_nullcontext("draft_token"):
                     propose_draft_token_ids(sampler_output.sampled_token_ids)
 
-        (
-            logprobs_lists,
-            valid_sampled_token_ids,
-            prompt_logprobs_dict,
-            req_ids_output_copy,
-            req_id_to_index_output_copy,
-            invalid_req_indices,
-        ) = self._bookkeeping_sync(
-            scheduler_output,
-            sampler_output,
-            logits,
-            hidden_states,
-            scheduler_output.total_num_scheduled_tokens,
-            spec_decode_metadata,
-        )
+        with self._request_trace.phase(trace_step, "bookkeeping", **trace_fields):
+            (
+                logprobs_lists,
+                valid_sampled_token_ids,
+                prompt_logprobs_dict,
+                req_ids_output_copy,
+                req_id_to_index_output_copy,
+                invalid_req_indices,
+            ) = self._bookkeeping_sync(
+                scheduler_output,
+                sampler_output,
+                logits,
+                hidden_states,
+                scheduler_output.total_num_scheduled_tokens,
+                spec_decode_metadata,
+            )
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
@@ -2408,6 +2508,7 @@ class NPUModelRunner(GPUModelRunner):
                     routing_data=self.routed_experts_cpu[:total].numpy(),
                     slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
                 )
+            self._end_request_trace_step("completed")
             return model_runner_output
         
         # Async path: produce a device-side snapshot that the async
@@ -2445,6 +2546,7 @@ class NPUModelRunner(GPUModelRunner):
             async_output.sampled_token_ids_cpu,
             async_output.async_copy_ready_event,
         )
+        self._end_request_trace_step("completed")
         return async_output
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
