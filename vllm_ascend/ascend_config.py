@@ -61,6 +61,9 @@ class AscendConfig:
     def __init__(self, vllm_config: "VllmConfig"):
         self.vllm_config = vllm_config
         additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}
+        self.gemma4_template_early_exit = additional_config.get("gemma4_template_early_exit", False)
+        if type(self.gemma4_template_early_exit) is not bool:
+            raise ValueError("gemma4_template_early_exit must be a boolean")
         self._check_mooncake_c8_kv_cache_quant(vllm_config)
 
         xlite_graph_config = additional_config.get("xlite_graph_config", {})
