@@ -2308,8 +2308,8 @@ class NPUModelRunner(GPUModelRunner):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         if not hasattr(self, "_request_trace"):
             self._request_trace = RequestTrace(rank=0)
-        trace_step = self._request_trace_active_step
-        trace_fields = self._request_trace_active_fields or {}
+        trace_step = getattr(self, "_request_trace_active_step", None)
+        trace_fields = getattr(self, "_request_trace_active_fields", None) or {}
         self._request_trace.emit("sample_begin", step_id=trace_step, **trace_fields)
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None

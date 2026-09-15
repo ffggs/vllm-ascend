@@ -37,6 +37,15 @@ This document provides instructions for contributors to the vLLM Ascend project.
 
 ## Setup and Environment
 
+### Network Access Policy
+
+The `127.0.0.1:8787` proxy is reserved for Codex model connectivity and must
+not be used for ordinary network requests. Package managers, Git, Git LFS,
+and other repository or artifact downloads should use direct network access;
+unset `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, `https_proxy`, and related
+proxy variables for those commands unless the user explicitly directs
+otherwise.
+
 ### Environment Variables
 
 All environment variables must be defined in `vllm_ascend/envs.py` using the centralized `env_variables` dictionary.
