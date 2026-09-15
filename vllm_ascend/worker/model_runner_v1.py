@@ -122,7 +122,6 @@ from vllm_ascend.attention.utils import (
     get_sfa_qsfa_packed_head_dim,
     using_paged_attention,
 )
-from vllm_ascend.profiler.request_trace import RequestTrace
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -151,6 +150,7 @@ from vllm_ascend.model_executor.offloader import create_offloader
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.ops.triton.spec_decode.ngram import triton_ngram_spec_decode
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
+from vllm_ascend.profiler.request_trace import RequestTrace
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
@@ -1853,6 +1853,7 @@ class NPUModelRunner(GPUModelRunner):
                 )
             )
         trace_fields = {
+            "scheduler_key": getattr(scheduler_output, "_request_trace_key", None),
             "request_ids": trace_req_ids,
             "scheduled_tokens": trace_scheduled_tokens,
             "computed_tokens": trace_computed_tokens,

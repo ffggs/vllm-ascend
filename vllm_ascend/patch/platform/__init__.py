@@ -57,3 +57,10 @@ import vllm_ascend.patch.platform.patch_speculative_config  # noqa
 
 import vllm_ascend.patch.platform.patch_fused_moe  # noqa
 import vllm_ascend.patch.platform.patch_dp_device_ids  # noqa
+
+from vllm_ascend import envs as _ascend_envs
+
+if _ascend_envs.VLLM_ASCEND_REQUEST_TRACE_DIR:
+    from vllm_ascend.profiler.request_trace_hooks import enable_scheduler_trace
+
+    enable_scheduler_trace()

@@ -15,9 +15,12 @@ import json
 import os
 import threading
 import time
-from contextlib import contextmanager
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
+
+from vllm_ascend import envs
 
 
 def _jsonable(value: Any) -> Any:
@@ -34,7 +37,7 @@ class RequestTrace:
     """Write request/step events and matching torch profiler scopes."""
 
     def __init__(self, *, rank: int, process: str = "worker") -> None:
-        trace_dir = os.getenv("VLLM_REQUEST_TRACE_DIR")
+        trace_dir = envs.VLLM_ASCEND_REQUEST_TRACE_DIR
         self.enabled = bool(trace_dir)
         self._file = None
         self._lock = threading.Lock()
@@ -101,10 +104,8 @@ class RequestTrace:
     def __del__(self) -> None:
         # Best-effort flush for worker shutdown. Explicit close remains the
         # preferred lifecycle operation because interpreter teardown is partial.
-        try:
+        with suppress(Exception):
             self.close()
-        except Exception:
-            pass
 
 
 def disabled_request_trace() -> RequestTrace:
