@@ -10,6 +10,7 @@ import json
 import os
 from functools import wraps
 
+from vllm_ascend.profiler.frontend_trace import FrontendTrace
 from vllm_ascend.profiler.request_trace import RequestTrace
 
 
@@ -108,6 +109,9 @@ def enable_scheduler_trace():
 def install_frontend_trace(state, trace):
     serving = state.openai_serving_chat
     engine = state.engine_client
+    frontend = FrontendTrace(trace)
+    online_renderer = getattr(serving, "online_renderer", None)
+    frontend.install(getattr(online_renderer, "renderer", None), getattr(engine, "profiler", None))
     original_render = serving.render_chat_request
     original_add = engine.add_request
     original_enqueue = engine._add_request
@@ -116,11 +120,13 @@ def install_frontend_trace(state, trace):
     @wraps(original_render)
     async def render(request, *args, **kwargs):
         fields = {"request_id": request.request_id}
+        context_token = frontend.request_id.set(request.request_id)
         trace.emit("render_begin", **fields)
         try:
             return await original_render(request, *args, **kwargs)
         finally:
             trace.emit("render_end", **fields)
+            frontend.request_id.reset(context_token)
 
     @wraps(original_add)
     async def add_request(request_id, *args, **kwargs):

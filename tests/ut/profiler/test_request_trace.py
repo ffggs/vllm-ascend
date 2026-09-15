@@ -3,11 +3,14 @@ import json
 import os
 import pickle
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+from vllm_ascend.profiler.frontend_trace import FrontendTrace
 from vllm_ascend.profiler.request_trace import RequestTrace
 from vllm_ascend.profiler.request_trace_hooks import (
     RequestTraceMiddleware,
@@ -17,6 +20,78 @@ from vllm_ascend.profiler.request_trace_hooks import (
 
 
 class TestRequestTrace(unittest.TestCase):
+    def test_frontend_profiler_covers_renderer_thread(self):
+        import torch
+
+        frontend = FrontendTrace(Mock())
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            profiler = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU])
+            # Installing wraps module methods; restore them after the test.
+            with (
+                patch("transformers.TokenizersBackend.__call__"),
+                patch("transformers.tokenization_utils_base.render_jinja_template"),
+            ):
+                frontend.install(SimpleNamespace(_executor=executor), profiler)
+                # Model AsyncLLM: start/stop from an auxiliary thread, while
+                # rendering happens on an existing, separate executor.
+                with ThreadPoolExecutor(max_workers=1) as controller:
+                    controller.submit(profiler.start).result(timeout=5)
+                    token = frontend.request_id.set("profiled-request")
+                    try:
+                        executor.submit(frontend.wrap_sync(lambda: 7, "chat_template")).result(timeout=5)
+                    finally:
+                        frontend.request_id.reset(token)
+                        controller.submit(profiler.stop).result(timeout=5)
+            names = {event.name for event in profiler.events()}
+            self.assertIn("vllm.frontend_trace request=profiled-request stage=chat_template", names)
+            self.assertIn("vllm.frontend_trace request=profiled-request stage=executor_work", names)
+
+    def test_frontend_executor_preserves_request_identity_and_values(self):
+        """Interleaved requests keep their IDs after crossing worker threads."""
+        trace = Mock()
+        frontend = FrontendTrace(trace)
+        barrier = threading.Barrier(2)
+
+        def work(value):
+            barrier.wait(timeout=5)
+            with frontend.stage("tokenize"):
+                return value
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            frontend.install_executor(executor)
+            futures = []
+            for request_id in ("a", "b"):
+                token = frontend.request_id.set(request_id)
+                futures.append(executor.submit(work, request_id))
+                frontend.request_id.reset(token)
+            self.assertEqual([f.result(timeout=5) for f in futures], ["a", "b"])
+            calls_before = trace.emit.call_count
+            self.assertEqual(executor.submit(lambda: 3).result(timeout=5), 3)
+            self.assertEqual(trace.emit.call_count, calls_before)
+        stages = [c.kwargs for c in trace.emit.call_args_list if c.args[0] == "frontend_stage_end"]
+        self.assertEqual(
+            sorted((s["request_id"], s["stage"]) for s in stages),
+            [("a", "executor_work"), ("a", "tokenize"), ("b", "executor_work"), ("b", "tokenize")],
+        )
+        self.assertTrue(all(s["thread_cpu_ns"] >= 0 and s["elapsed_ns"] >= 0 for s in stages))
+
+    def test_frontend_worker_exception_propagates_and_closes_stage(self):
+        trace = Mock()
+        frontend = FrontendTrace(trace)
+
+        def fail():
+            raise ValueError("encoding failed")
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            frontend.install_executor(executor)
+            token = frontend.request_id.set("failing-request")
+            future = executor.submit(frontend.wrap_sync(fail, "tokenize"))
+            frontend.request_id.reset(token)
+            with self.assertRaisesRegex(ValueError, "encoding failed"):
+                future.result(timeout=5)
+        ends = [c.kwargs["stage"] for c in trace.emit.call_args_list if c.args[0] == "frontend_stage_end"]
+        self.assertEqual(ends, ["tokenize", "executor_work"])
+
     def test_disabled_trace_is_side_effect_free(self):
         with patch.dict(os.environ, {}, clear=True):
             trace = RequestTrace(rank=0)
