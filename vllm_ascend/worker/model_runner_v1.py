@@ -2547,6 +2547,10 @@ class NPUModelRunner(GPUModelRunner):
             async_output.sampled_token_ids_cpu,
             async_output.async_copy_ready_event,
         )
+        if self._request_trace.enabled:
+            from vllm_ascend.profiler.output_trace import trace_async_output
+
+            trace_async_output(async_output, self._request_trace, trace_step, trace_fields)
         self._end_request_trace_step("completed")
         return async_output
 

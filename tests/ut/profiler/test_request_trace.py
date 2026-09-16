@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from vllm_ascend.profiler.frontend_trace import FrontendTrace
+from vllm_ascend.profiler.output_trace import install_api_output_trace, trace_async_output
 from vllm_ascend.profiler.request_trace import RequestTrace
 from vllm_ascend.profiler.request_trace_hooks import (
     RequestTraceMiddleware,
@@ -20,6 +21,94 @@ from vllm_ascend.profiler.request_trace_hooks import (
 
 
 class TestRequestTrace(unittest.TestCase):
+    def test_output_materialization_preserves_value_and_closes_on_failure(self):
+        trace = RequestTrace(rank=0)
+        trace.enabled = True
+        trace.emit = Mock()
+        expected = object()
+        output = SimpleNamespace(get_output=Mock(side_effect=[expected, ValueError("copy failure")]))
+        trace_async_output(output, trace, 19, {"request_ids": ["r0"], "scheduler_key": [12, 7]})
+        self.assertIs(output.get_output(), expected)
+        with self.assertRaisesRegex(ValueError, "copy failure"):
+            output.get_output()
+        self.assertEqual(
+            [c.args[0] for c in trace.emit.call_args_list],
+            [
+                "phase_begin",
+                "output_materialize_cpu",
+                "phase_end",
+                "phase_begin",
+                "output_materialize_cpu",
+                "phase_end",
+            ],
+        )
+        self.assertTrue(all(c.kwargs["step_id"] == 19 for c in trace.emit.call_args_list))
+
+    def test_api_transport_keeps_batch_identity_and_output_object(self):
+        trace = Mock()
+        output = SimpleNamespace(outputs=[SimpleNamespace(request_id="r0")], timestamp=3.5)
+        queue = asyncio.Queue()
+        client = SimpleNamespace(
+            decoder=SimpleNamespace(decode=Mock(return_value=output)),
+            outputs_queue=queue,
+            get_output_async=AsyncMock(return_value=output),
+        )
+        install_api_output_trace(client, trace)
+        self.assertIs(client.decoder.decode(b"encoded"), output)
+        client.outputs_queue.put_nowait(output)
+        self.assertIs(queue.get_nowait(), output)
+        self.assertIs(asyncio.run(client.get_output_async()), output)
+        self.assertTrue(all(c.kwargs["request_ids"] == ["r0"] for c in trace.emit.call_args_list))
+        self.assertTrue(all(c.kwargs["output_timestamp"] == 3.5 for c in trace.emit.call_args_list))
+
+    def test_async_stage_does_not_charge_other_tasks_cpu_and_keeps_parent(self):
+        trace = Mock()
+        frontend = FrontendTrace(trace)
+
+        async def work():
+            await asyncio.sleep(0)
+            with frontend.stage("sync_child"):
+                return 17
+
+        token = frontend.request_id.set("request-a")
+        try:
+            self.assertEqual(asyncio.run(frontend.wrap_async(work, "async_parent")()), 17)
+            self.assertIsNone(frontend.parent_span.get())
+        finally:
+            frontend.request_id.reset(token)
+        ends = {c.kwargs["stage"]: c.kwargs for c in trace.emit.call_args_list if c.args[0] == "frontend_stage_end"}
+        self.assertIsNone(ends["async_parent"]["thread_cpu_ns"])
+        self.assertGreaterEqual(ends["sync_child"]["thread_cpu_ns"], 0)
+        self.assertEqual(ends["sync_child"]["parent_span_id"], ends["async_parent"]["span_id"])
+
+    def test_output_stages_bind_actual_request_and_preserve_results(self):
+        trace = Mock()
+        frontend = FrontendTrace(trace)
+        value = SimpleNamespace(outputs=[SimpleNamespace(text="first")])
+        state = SimpleNamespace(
+            request_id="actual-request",
+            detokenizer=SimpleNamespace(update=Mock(return_value="stop")),
+            logprobs_processor=None,
+            make_request_output=Mock(return_value=value),
+            queue=SimpleNamespace(put=Mock()),
+        )
+        original_output = state.make_request_output
+        frontend.install_output_state(state)
+        frontend.install_output_state(state)
+        token = frontend.request_id.set("unrelated-task")
+        try:
+            self.assertEqual(state.detokenizer.update([42], False), "stop")
+            self.assertIs(state.make_request_output([42]), value)
+            state.queue.put(value)
+            self.assertEqual(frontend.request_id.get(), "unrelated-task")
+            before = trace.emit.call_count
+            self.assertEqual(state.detokenizer.update([43], False), "stop")
+            self.assertEqual(trace.emit.call_count, before)
+        finally:
+            frontend.request_id.reset(token)
+        original_output.assert_called_once_with([42])
+        self.assertTrue(all(c.kwargs["request_id"] == "actual-request" for c in trace.emit.call_args_list))
+
     def test_frontend_profiler_covers_renderer_thread(self):
         import torch
 
@@ -149,6 +238,7 @@ class TestRequestTrace(unittest.TestCase):
             update_from_output=Mock(return_value={}),
             running=[],
             waiting=[],
+            kv_cache_manager=SimpleNamespace(get_computed_blocks=Mock(return_value=("blocks", 128, 128))),
         )
         with (
             tempfile.TemporaryDirectory() as directory,
@@ -156,6 +246,10 @@ class TestRequestTrace(unittest.TestCase):
         ):
             install_scheduler_trace(scheduler)
             install_scheduler_trace(scheduler)
+            self.assertEqual(
+                scheduler.kv_cache_manager.get_computed_blocks(SimpleNamespace(request_id="r0")),
+                ("blocks", 128, 128),
+            )
             self.assertEqual(scheduler.add_request(SimpleNamespace(request_id="r0", num_prompt_tokens=9)), "added")
             first, second = scheduler.schedule(False), scheduler.schedule(False)
             self.assertIs(first, outputs[0])

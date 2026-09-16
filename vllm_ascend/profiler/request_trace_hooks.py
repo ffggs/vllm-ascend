@@ -11,6 +11,11 @@ import os
 from functools import wraps
 
 from vllm_ascend.profiler.frontend_trace import FrontendTrace
+from vllm_ascend.profiler.output_trace import (
+    install_api_output_trace,
+    install_collector_trace,
+    install_engine_output_trace,
+)
 from vllm_ascend.profiler.request_trace import RequestTrace
 
 
@@ -21,7 +26,18 @@ def install_scheduler_trace(scheduler):
     if not trace.enabled:
         return
     scheduler._scheduler_request_trace = trace
+    install_engine_output_trace(trace)
     trace.emit("scheduler_initialized", scheduler_class=type(scheduler).__qualname__)
+    cache_manager = getattr(scheduler, "kv_cache_manager", None)
+    if cache_manager is not None:
+        original_lookup = cache_manager.get_computed_blocks
+
+        @wraps(original_lookup)
+        def lookup(request, *args, **kwargs):
+            with trace.phase(None, "kv_cache_lookup", request_id=request.request_id):
+                return original_lookup(request, *args, **kwargs)
+
+        cache_manager.get_computed_blocks = lookup
     original_add = scheduler.add_request
     original_schedule = scheduler.schedule
     original_update = scheduler.update_from_output
@@ -107,11 +123,26 @@ def enable_scheduler_trace():
 
 
 def install_frontend_trace(state, trace):
+    from pydantic import TypeAdapter
+    from starlette.requests import Request
+    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest, ChatCompletionStreamResponse
+
     serving = state.openai_serving_chat
     engine = state.engine_client
     frontend = FrontendTrace(trace)
+    install_api_output_trace(getattr(engine, "engine_core", None), trace)
+    install_collector_trace(trace)
     online_renderer = getattr(serving, "online_renderer", None)
     frontend.install(getattr(online_renderer, "renderer", None), getattr(engine, "profiler", None))
+    frontend.install_method(online_renderer, "preprocess_chat", "preprocess_chat", asynchronous=True)
+    frontend.install_method(serving, "_check_model", "check_model", asynchronous=True)
+    frontend.install_method(getattr(engine, "input_processor", None), "process_inputs", "engine_process_inputs")
+    frontend.install_method(engine.output_processor, "add_request", "output_state_create")
+    frontend.install_method(Request, "json", "http_json_body", asynchronous=True)
+    frontend.install_method(TypeAdapter, "validate_python", "http_schema_validation")
+    frontend.install_method(ChatCompletionStreamResponse, "model_dump_json", "sse_serialize")
+    for name in ("build_tok_params", "build_chat_params", "to_sampling_params"):
+        frontend.install_method(ChatCompletionRequest, name, name)
     original_render = serving.render_chat_request
     original_add = engine.add_request
     original_enqueue = engine._add_request
@@ -130,11 +161,13 @@ def install_frontend_trace(state, trace):
 
     @wraps(original_add)
     async def add_request(request_id, *args, **kwargs):
+        context_token = frontend.request_id.set(request_id)
         trace.emit("engine_add_begin", request_id=request_id)
         try:
             return await original_add(request_id, *args, **kwargs)
         finally:
             trace.emit("engine_add_end", request_id=request_id)
+            frontend.request_id.reset(context_token)
 
     @wraps(original_enqueue)
     async def enqueue(request, *args, **kwargs):
@@ -148,20 +181,46 @@ def install_frontend_trace(state, trace):
     @wraps(original_process)
     def process_outputs(engine_core_outputs, *args, **kwargs):
         for output in engine_core_outputs:
+            request_state = getattr(engine.output_processor, "request_states", {}).get(output.request_id)
+            if request_state is not None:
+                frontend.install_output_state(request_state)
             trace.emit(
                 "api_output_received",
                 request_id=output.request_id,
                 new_tokens=len(output.new_token_ids),
                 finish_reason=output.finish_reason,
             )
-        result = original_process(engine_core_outputs, *args, **kwargs)
-        trace.emit("api_output_processed", request_ids=[o.request_id for o in engine_core_outputs])
-        return result
+        # The long-lived output task can inherit the first request's context.
+        # A batch must not be attributed to that request; inner wrappers bind
+        # the ID of the actual RequestState instead.
+        context_token = frontend.request_id.set(None)
+        try:
+            return original_process(engine_core_outputs, *args, **kwargs)
+        finally:
+            trace.emit("api_output_processed", request_ids=[o.request_id for o in engine_core_outputs])
+            frontend.request_id.reset(context_token)
+
+    original_stats = getattr(engine.output_processor, "_update_stats_from_output", None)
+    if original_stats is not None:
+
+        @wraps(original_stats)
+        def update_stats(request_state, *args, **kwargs):
+            if getattr(request_state, "_ascend_first_content_ready", False):
+                return original_stats(request_state, *args, **kwargs)
+            token = frontend.request_id.set(request_state.request_id)
+            try:
+                with frontend.stage("output_stats"):
+                    return original_stats(request_state, *args, **kwargs)
+            finally:
+                frontend.request_id.reset(token)
+
+        engine.output_processor._update_stats_from_output = update_stats
 
     serving.render_chat_request = render
     engine.add_request = add_request
     engine._add_request = enqueue
     engine.output_processor.process_outputs = process_outputs
+    return frontend
 
 
 class RequestTraceMiddleware:
@@ -175,6 +234,7 @@ class RequestTraceMiddleware:
         self.app = app
         self.trace = RequestTrace(rank=0, process="api")
         self.installed = False
+        self.frontend = None
 
     async def __call__(self, scope, receive, send):
         if not self.trace.enabled or scope["type"] != "http" or scope.get("path") != "/v1/chat/completions":
@@ -183,7 +243,7 @@ class RequestTraceMiddleware:
         trace = self.trace
         trace.emit("http_received", request_id=request_id)
         if not self.installed:
-            install_frontend_trace(scope["app"].state, trace)
+            self.frontend = install_frontend_trace(scope["app"].state, trace)
             self.installed = True
         first_content = False
         buffer = ""
@@ -197,7 +257,12 @@ class RequestTraceMiddleware:
 
         async def traced_send(message):
             nonlocal first_content, buffer
+            observing = message["type"] == "http.response.body" and not first_content
+            if observing:
+                trace.emit("http_body_send_begin", request_id=request_id, bytes=len(message.get("body", b"")))
             await send(message)
+            if observing:
+                trace.emit("http_body_send_end", request_id=request_id)
             if message["type"] == "http.response.start":
                 trace.emit("http_headers_sent", request_id=request_id, status=message["status"])
             if message["type"] == "http.response.body" and not first_content:
@@ -213,13 +278,18 @@ class RequestTraceMiddleware:
                     if any(c.get("delta", {}).get("content") for c in data.get("choices", [])):
                         first_content = True
                         trace.emit("http_first_content_sent", request_id=request_id, response_id=data.get("id"))
+                        if self.frontend is not None:
+                            self.frontend.request_id.set(None)
                         buffer = ""
                         break
 
         try:
+            context_token = self.frontend.request_id.set(request_id) if self.frontend else None
             await self.app(scope, traced_receive, traced_send)
         except BaseException as exc:
             trace.emit("http_error", request_id=request_id, error_type=type(exc).__name__)
             raise
         finally:
             trace.emit("http_end", request_id=request_id, had_content=first_content)
+            if self.frontend is not None and context_token is not None:
+                self.frontend.request_id.reset(context_token)

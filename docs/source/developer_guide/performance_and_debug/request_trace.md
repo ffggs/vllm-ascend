@@ -43,6 +43,30 @@ and encoding, including calls made in worker threads. Stages record native
 thread IDs, monotonic elapsed time, and calling-thread CPU time. Thread CPU time
 excludes CPU work performed by any additional native tokenizer threads. Nested
 stage durations must not be added to their enclosing executor duration.
+Each stage has a `span_id` and `parent_span_id`. Asynchronous stages set
+`async_wait=true` and `thread_cpu_ns=null`: their elapsed time includes
+suspension, and the event-loop thread can execute other requests in between.
+Only synchronous stages have calling-thread CPU measurements and torch scopes.
+Additional stages cover HTTP JSON/schema processing, chat message parsing,
+template resolution/parameters, token encoding and engine input construction.
+
+Output tracing binds the internal ID of each request rather than the context
+inherited by the long-lived output task. It records first-content detokenizer
+updates, native decode-stream steps, logprobs, output construction and stats.
+`api_request_output_ready` and `api_output_queued` precede HTTP content emission.
+The enclosing `api_output_received`/`api_output_processed` interval still covers
+an entire batch, including other requests, and is not exclusive request cost.
+Per-request output stages stop once nonempty output text is ready.
+`output_materialize` measures the existing asynchronous token-copy completion
+and CPU output conversion; it adds no device synchronization. A worker step end
+can precede this operation. Scheduler output, engine queue put/get, Msgpack
+encoding, ZMQ send, API Msgpack decoding, API batch queue and per-request
+collector dequeue are recorded separately. Batch events retain request IDs and
+the engine output timestamp to distinguish consecutive decode outputs. The
+gap between send completion and API decoding can include event-loop scheduling
+as well as transport; do not label the entire gap as network time.
+`sse_serialize` and HTTP body send begin/end cover JSON serialization and ASGI
+handoff. ASGI send completion is not an acknowledgment of client receipt.
 Frontend CPU and worker CPU+NPU capture can run in the same profiling window;
 separate process files are joined using the request timestamps and IDs.
 The middleware enables PyTorch's `profile_all_threads` option on the standard
