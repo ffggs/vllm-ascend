@@ -12,7 +12,9 @@ Model Runner V2. The checkpoint must carry per-layer ModelSlim descriptions:
 ```json
 {
   "model.language_model.layers.11.self_attn.quant_type": "QK_INT8_DYNAMIC_V_INT8_PER_CHANNEL",
-  "model.language_model.layers.11.self_attn.indexer.quant_type": "QK_INT8_DYNAMIC"
+  "model.language_model.layers.11.self_attn.indexer.quant_type": "QK_INT8_DYNAMIC",
+  "mtp.layers.0.self_attn.quant_type": "QK_INT8_DYNAMIC_V_INT8",
+  "mtp.layers.0.self_attn.indexer.quant_type": "QK_INT8_DYNAMIC"
 }
 ```
 
@@ -23,8 +25,12 @@ Unmarked owners retain their existing cache precision, including MTP layers
 excluded from FA3 by the calibration recipe. Unsupported per-layer FA3 modes
 raise a construction error naming the owner and requested mode.
 
-Use dynamic symmetric INT8 Q/K and calibrated symmetric INT8 V with one
-FP32 scale per `(KV head, channel)`. The checkpoint must include
+Q/K use dynamic symmetric INT8. Each marked main or MTP attention layer
+selects its own static V granularity. `QK_INT8_DYNAMIC_V_INT8` uses one
+FP32 scale per KV head, stored as `[num_kv_heads, 1]`.
+`QK_INT8_DYNAMIC_V_INT8_PER_CHANNEL` uses one scale per KV head and channel.
+Per-head scales are broadcast across channels once at load time for GBSA.
+The checkpoint must include
 `<self_attn>.fa_v.scale` and zero INT8 `<self_attn>.fa_v.offset`. The loader
 validates scales and handles KV-head sharding/replication under TP. Dynamic-V
 `INT8_DYNAMIC` checkpoints require re-quantization with static V; they are
@@ -35,7 +41,7 @@ not execute MTP. The raw indexer compression ring stays BF16.
 
 The QSA cache stores INT8 K/V codes in scheduler-managed pages. FP32 K
 scales use a dense `[physical page, KV head, token]` view of the same
-allocation. V uses checkpoint per-channel scales. Mixed BF16/C8 owners honor
+allocation. V uses the layer's calibrated scales. Mixed BF16/C8 owners honor
 their physical page strides and retain scheduler block IDs. Each indexer
 page stores dense INT8 keys and FP16 scales for A2/A3 QLI v2.
 
