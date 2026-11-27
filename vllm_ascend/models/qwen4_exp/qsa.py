@@ -64,6 +64,7 @@ from .lightning_indexer import (
     QSAIndexerMetadataProtocol,
     qsa_select_paged_tokens_lightning_v2,
     qsa_select_paged_tokens_quantized,
+    request_batched_decode_width,
 )
 from .quantization import C8_SCALE_BYTES, QSAC8Spec, QSAStaticVParameters, uses_qsa_c8_quantization
 
@@ -566,6 +567,7 @@ class AscendQSAIndexer(upstream_indexer.QSAIndexer):
                 self.token_topk,
                 self.compress_ratio,
                 out,
+                decode_width=request_batched_decode_width(metadata, query.shape[0]),
             )
         logger.info_once("QSA is using native request-batched LightningIndexerV2 through the CANN Torch interface.")
         return qsa_select_paged_tokens_lightning_v2(

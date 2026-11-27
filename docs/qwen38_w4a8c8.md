@@ -42,7 +42,9 @@ page stores dense INT8 keys and FP16 scales for A2/A3 QLI v2.
 Main attention calls native INT8 GBSA (`quant_mode=7`) with INT8 Q/K/V,
 FP32 Q/K/V scales, probability quantization multiplier 127, BF16 output
 and FP32 softmax. GBSA follows the scheduler page table to read the original
-K/V codes and K scales. The indexer calls native INT8 QLI v2.
+K/V codes and K scales. On A3, the native INT8 indexer shares each request's
+page table across its query tokens during uniform multi-token decode. Prefill
+and single-token decode use explicit per-row visibility.
 
 GDN state and BF16 draft layers affect total memory savings. INT8 QSA
 attention and indexer caches require prefill context parallel size 1.

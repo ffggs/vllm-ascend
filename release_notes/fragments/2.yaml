@@ -1,0 +1,4 @@
+pr: 2
+entries:
+  - category: performance
+    text: Qwen3.8 C8 speculative decoding on A3 now shares a single KV page table across verification tokens from the same request during INT8 index selection.
