@@ -65,7 +65,7 @@ from .lightning_indexer import (
     qsa_select_paged_tokens_lightning_v2,
     qsa_select_paged_tokens_quantized,
 )
-from .quantization import C8_SCALE_BYTES, QSAC8Spec, QSAStaticVParameters, uses_qsa_c8_quantization
+from .quantization import C8_SCALE_BYTES, QSAC8Spec, QSAStaticVParameters, uses_mtp_per_head_v, uses_qsa_c8_quantization
 
 if TYPE_CHECKING:
     import vllm.models.qwen4_exp.amd.qsa_indexer as upstream_indexer
@@ -1022,6 +1022,7 @@ class AscendQwen4ExpQSAAttention(upstream_qsa.Qwen4ExpQSAAttention):
                 self.head_dim,
                 get_tensor_model_parallel_world_size(),
                 get_tensor_model_parallel_rank(),
+                per_head=uses_mtp_per_head_v(quant_config, prefix),
             )
             self.register_buffer(
                 "c8_p_scale",

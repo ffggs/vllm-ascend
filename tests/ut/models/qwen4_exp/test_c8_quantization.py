@@ -482,6 +482,63 @@ def test_static_v_quantization_uses_channel_scales_and_saturates():
     assert quantize_qsa_values(rows, scale).tolist() == [[[0, 2, -128, 127]], [[2, -2, 0, 0]]]
 
 
+def test_per_head_v_marker_is_scoped_to_draft_attention():
+    marker = "QK_INT8_DYNAMIC_V_INT8"
+    target = "model.layers.0.self_attn"
+    draft = "mtp.layers.48.self_attn"
+    config = SimpleNamespace(quant_description={f"{p}.quant_type": marker for p in (target, draft, draft + ".indexer")})
+    assert uses_qsa_c8_quantization(config, draft)
+    with pytest.raises(ValueError, match="Unsupported"):
+        uses_qsa_c8_quantization(config, target)
+    with pytest.raises(ValueError, match="Unsupported"):
+        uses_qsa_c8_quantization(config, draft + ".indexer", indexer=True)
+
+
+@pytest.mark.parametrize("tp_size, rank, expected", [(1, 0, [1, 2]), (2, 1, [2]), (4, 3, [2])])
+def test_mtp_static_v_per_head_sharding(tp_size, rank, expected):
+    module = QSAStaticVParameters(2, 4, tp_size, rank, per_head=True)
+    values = torch.tensor([[1.0], [2.0]])
+    module.load_scale(module.scale, values)
+    module.load_offset(module.offset, torch.zeros_like(values, dtype=torch.int8))
+    module.process_weights_after_loading()
+    torch.testing.assert_close(module.scale, torch.tensor(expected, dtype=torch.float32)[:, None].expand(-1, 4))
+    with pytest.raises(ValueError, match="global KV heads, 1"):
+        module.load_scale(module.scale, values.expand(-1, 4))
+    with pytest.raises(ValueError, match="zero offset"):
+        module.load_offset(module.offset, torch.ones_like(values, dtype=torch.int8))
+
+
+def test_mtp_per_head_outer_weight_loader_preserves_target_mapper(monkeypatch):
+    from vllm_ascend.models.qwen4_exp import mtp
+    from vllm_ascend.quantization.configs.modelslim_config import AscendModelSlimConfig
+
+    config = AscendModelSlimConfig(
+        {"fa_quant_type": "FAKQuant", "mtp.layers.0.self_attn.quant_type": "QK_INT8_DYNAMIC_V_INT8"}
+    )
+
+    def init_draft(self, *, vllm_config, prefix):
+        torch.nn.Module.__init__(self)
+        self.quant_config = vllm_config.quant_config
+        self.model = torch.nn.Module()
+        self.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+        attention = torch.nn.Module()
+        self.model.layers[0].self_attn = attention
+        attention.fa_v = QSAStaticVParameters(2, 4, 4, 3, per_head=True)
+
+    monkeypatch.setattr(mtp.upstream_mtp.Qwen4ExpMTP, "__init__", init_draft)
+    model = mtp.AscendQwen4ExpMTP(vllm_config=SimpleNamespace(quant_config=config))
+    assert config.enable_fa_quant
+    model.load_weights(
+        [
+            ("mtp.layers.0.self_attn.fa_v.scale", torch.tensor([[1.0], [2.0]])),
+            ("mtp.layers.0.self_attn.fa_v.offset", torch.zeros(2, 1, dtype=torch.int8)),
+        ]
+    )
+    module = model.model.layers[0].self_attn.fa_v
+    module.process_weights_after_loading()
+    torch.testing.assert_close(module.scale, torch.full((1, 4), 2.0))
+
+
 def test_modelslim_static_v_mapper_and_actual_auto_loader():
     from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 

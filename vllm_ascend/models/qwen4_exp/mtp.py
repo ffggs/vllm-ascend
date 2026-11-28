@@ -14,6 +14,7 @@
 
 """Ascend wrapper for Qwen3.8-Flash-Next MTP."""
 
+from copy import copy
 from typing import Any
 
 import regex as re
@@ -30,6 +31,7 @@ from vllm_ascend.models.common.ops.sequence_parallel import sp_shard
 # Import the target wrapper first so the upstream decoder resolves Ascend QSA
 # and HyperConnection components before the MTP module is initialized.
 from . import model as _model  # noqa: F401
+from .quantization import QSAStaticVParameters
 
 _MTP_LAYER_PREFIX = re.compile(r"^mtp\.layers\.(\d+)(?=\.)")
 
@@ -247,6 +249,16 @@ upstream_mtp.Qwen4ExpMultiTokenPredictor = AscendQwen4ExpMultiTokenPredictor
 
 class AscendQwen4ExpMTP(upstream_mtp.Qwen4ExpMTP):
     """Qwen4Exp MTP model bound to the Ascend-patched decoder."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        if getattr(self.quant_config, "enable_fa_quant", False) and any(
+            isinstance(module, QSAStaticVParameters) and module.per_head for module in self.model.modules()
+        ):
+            # The outer draft weight loader uses this config. Its legacy MLA mapper
+            # would rename fa_v.scale/offset away from the QSA owner.
+            self.quant_config = copy(self.quant_config)
+            self.quant_config.enable_fa_quant = False
 
     def embed_input_ids(
         self,

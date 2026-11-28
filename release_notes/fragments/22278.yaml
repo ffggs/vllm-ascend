@@ -6,6 +6,7 @@ entries:
       with dynamic INT8 Q/K and calibrated static per-channel INT8 V. Use
       --quantization ascend --kv-cache-dtype auto with Model Runner V2 on
       Ascend 910B/A3 and CANN 9.3.0. Main attention uses native INT8 GBSA and
+      MTP attention also accepts calibrated per-head V scales, and
       the indexer uses INT8 QLI-v2. Dynamic-V checkpoints need re-quantization.
   - category: performance
     text: >-

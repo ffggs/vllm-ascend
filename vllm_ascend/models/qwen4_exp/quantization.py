@@ -29,6 +29,14 @@ class QSAC8Spec(FullAttentionSpec):
         return self.head_size + C8_SCALE_BYTES
 
 
+def uses_mtp_per_head_v(quant_config: Any, prefix: str) -> bool:
+    return (
+        prefix.startswith("mtp.layers.")
+        and prefix.endswith(".self_attn")
+        and getattr(quant_config, "quant_description", {}).get(f"{prefix}.quant_type") == "QK_INT8_DYNAMIC_V_INT8"
+    )
+
+
 def uses_qsa_c8_quantization(quant_config: Any, prefix: str, *, indexer: bool = False) -> bool:
     """Resolve an exact FA owner, independently of linear and MTP schemes.
 
@@ -41,6 +49,8 @@ def uses_qsa_c8_quantization(quant_config: Any, prefix: str, *, indexer: bool = 
         return False
     mode = description[key]
     expected = "QK_INT8_DYNAMIC" if indexer else C8_QSA_QUANT_TYPE
+    if not indexer and uses_mtp_per_head_v(quant_config, prefix):
+        return True
     if mode != expected:
         raise ValueError(f"Unsupported QSA FA3 mode {mode!r} for {prefix}; expected {expected}")
     return True
@@ -49,12 +59,13 @@ def uses_qsa_c8_quantization(quant_config: Any, prefix: str, *, indexer: bool = 
 class QSAStaticVParameters(torch.nn.Module):
     """Load ModelSlim's flattened (KV head, channel) scales with QKV TP rules."""
 
-    def __init__(self, total_heads: int, dim: int, tp_size: int, tp_rank: int) -> None:
+    def __init__(self, total_heads: int, dim: int, tp_size: int, tp_rank: int, *, per_head: bool = False) -> None:
         super().__init__()
         if min(total_heads, dim, tp_size) <= 0 or not 0 <= tp_rank < tp_size:
             raise ValueError("Invalid QSA V-scale tensor-parallel geometry")
         if max(total_heads, tp_size) % min(total_heads, tp_size):
             raise ValueError("QSA KV heads and TP size must divide each other")
+        self.per_head = per_head
         self.total_heads, self.dim = total_heads, dim
         self.local_heads = max(1, total_heads // tp_size)
         replicas = max(1, tp_size // total_heads)
@@ -69,6 +80,10 @@ class QSAStaticVParameters(torch.nn.Module):
         self.offset.weight_loader = self.load_offset
 
     def _shard(self, weight: torch.Tensor) -> torch.Tensor:
+        if self.per_head:
+            if weight.shape != (self.total_heads, 1):
+                raise ValueError("MTP per-head V parameters require [global KV heads, 1]")
+            return weight.narrow(0, self.head_start, self.local_heads).expand(-1, self.dim)
         if weight.numel() != self.total_heads * self.dim:
             raise ValueError("QSA V parameter must contain one value per global KV head/channel")
         return weight.reshape(self.total_heads, self.dim).narrow(0, self.head_start, self.local_heads)
